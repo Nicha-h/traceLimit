@@ -15,33 +15,26 @@ EXCLUDED = set()
 # Model configurations mapped to their specific API backends
 MODELS = {
     "llama-3.1-8b-instruct": {
-        "api_base": "https://api.together.xyz/v1",
-        "model_id": "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
-        "api_key": os.getenv("TOGETHER_API_KEY"),
-        "max_tokens": 4096,
+        "hf_id": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+        "max_new_tokens": 4096,
         "temperature": 0.0,
     },
     "qwen-2.5-7b-instruct": {
-        "api_base": "https://api.together.xyz/v1",
-        "model_id": "Qwen/Qwen2.5-7B-Instruct-Turbo",
-        "api_key": os.getenv("TOGETHER_API_KEY"),
-        "max_tokens": 4096,
+        "hf_id": "Qwen/Qwen2.5-7B-Instruct",
+        "max_new_tokens": 4096,
         "temperature": 0.0,
     },
     "phi-3.5-mini-instruct": {
-        "api_base": "https://api.together.xyz/v1",
-        "model_id": "microsoft/Phi-3.5-mini-instruct",
-        "api_key": os.getenv("TOGETHER_API_KEY"),
-        "max_tokens": 4096,
+        "hf_id": "microsoft/Phi-3.5-mini-instruct",
+        "max_new_tokens": 4096,
         "temperature": 0.0,
     },
 }
 
-# Mandatory rate-limiting sleep intervals (seconds) per API provider
 RATE_LIMITS = {
-    "llama-3.1-8b-instruct": {"sleep": 1.0},
-    "qwen-2.5-7b-instruct": {"sleep": 1.0},
-    "phi-3.5-mini-instruct": {"sleep": 1.0},
+    "llama-3.1-8b-instruct": {"sleep": 0},
+    "qwen-2.5-7b-instruct": {"sleep": 0},
+    "phi-3.5-mini-instruct": {"sleep": 0},
 }
 
 # Full 20-repository dataset meticulously mapped by type balance (5 repos per type)
