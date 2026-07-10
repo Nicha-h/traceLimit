@@ -1,28 +1,38 @@
 from __future__ import annotations
 
+import importlib
+from functools import lru_cache
 from typing import Any
 
-import openai
+from config import MODELS
 
 
-def _call_api_model(model_config: dict, prompt: str, temperature: float = 0.0) -> str:
-    client = openai.OpenAI(
-        base_url=model_config["api_base"],
-        api_key=model_config["api_key"],
+MODEL_LOADERS = {model_name: model_config["model_id"] for model_name, model_config in MODELS.items()}
+
+
+@lru_cache(maxsize=None)
+def _load_transformers_runtime(model_key: str) -> dict[str, Any]:
+    transformers = importlib.import_module("transformers")
+    AutoModelForCausalLM = transformers.AutoModelForCausalLM
+    AutoTokenizer = transformers.AutoTokenizer
+    BitsAndBytesConfig = transformers.BitsAndBytesConfig
+
+    model_id = MODEL_LOADERS[model_key]
+    quantization_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype="bfloat16",
     )
-
-    messages = [
-        {"role": "system", "content": "You are an expert Python debugger."},
-        {"role": "user", "content": prompt},
-    ]
-
-    response = client.chat.completions.create(
-        model=model_config["model_id"],
-        messages=messages,
-        temperature=temperature,
-        max_tokens=model_config.get("max_tokens", 4096),
+    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        attn_implementation="flash_attention_2",
+        quantization_config=quantization_config,
+        device_map="auto",
     )
-    return response.choices[0].message.content or ""
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return {"model": model, "tokenizer": tokenizer, "max_new_tokens": 4096}
 
 
 def _call_local_model(model_bundle: dict[str, Any], prompt: str, temperature: float = 0.0) -> str:
@@ -70,10 +80,14 @@ def _call_local_model(model_bundle: dict[str, Any], prompt: str, temperature: fl
     return tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
 
 
-def call_model(model_config: dict, prompt: str, temperature: float = 0.0) -> str:
+def get_local_runtime(model_key: str) -> dict[str, Any]:
+    return _load_transformers_runtime(model_key)
+
+
+def call_model(runtime: dict, prompt: str, temperature: float = 0.0) -> str:
     """
-    Executes a completion call against either an API-backed model config or a locally loaded Hugging Face model bundle.
+    Executes a completion call against a locally loaded Hugging Face model bundle.
     """
-    if isinstance(model_config, dict) and "model" in model_config and "tokenizer" in model_config:
-        return _call_local_model(model_config, prompt, temperature=temperature)
-    return _call_api_model(model_config, prompt, temperature=temperature)
+    if not isinstance(runtime, dict) or "model" not in runtime or "tokenizer" not in runtime:
+        raise TypeError("call_model expects a runtime dictionary with 'model' and 'tokenizer' entries")
+    return _call_local_model(runtime, prompt, temperature=temperature)

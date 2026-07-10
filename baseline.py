@@ -1,7 +1,7 @@
 
 import os
 
-from call_model import call_model
+from call_model import call_model, get_local_runtime
 from config import EXCLUDED, MODELS, REPOS
 from helpers import build_prompt
 from injector import read, run_pytest, apply_mutation, repo_has_native_extensions
@@ -44,7 +44,7 @@ if __name__ == "__main__":
         
         for model_name, model_cfg in MODELS.items():
             prompt = build_prompt(buggy_fn, [], os.path.basename(target_filepath))
-            result = call_model(model_cfg, prompt)
+            result = call_model(get_local_runtime(model_name), prompt)
             
             if not tests_pass(repo, result):
                 EXCLUDED.add((repo['name'], model_name))

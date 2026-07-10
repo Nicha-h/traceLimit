@@ -51,9 +51,16 @@ It also includes a long-context note for local model runs where Flash Attention 
         code(
             """from pathlib import Path
 import os
+import sys
 import time
 import pandas as pd
 import matplotlib.pyplot as plt
+
+DATASET_ROOT = Path('/kaggle/input/Repository')
+if DATASET_ROOT.exists():
+    sys.path.append(str(DATASET_ROOT))
+    os.environ.setdefault('TRACELIMIT_DATASET_ROOT', str(DATASET_ROOT))
+REPO_ROOT = DATASET_ROOT / 'repos' if DATASET_ROOT.exists() else Path('repos')
 
 from config import DEPTHS, EXCLUDED, MODELS, RATE_LIMITS, REPOS
 from injector import build_context, inject_at_depth, repo_has_native_extensions, validate
@@ -63,6 +70,8 @@ from helpers import build_prompt, count_tokens, extract_code_block
 
 ROOT = Path.cwd()
 print(f"Working from {ROOT}")
+print("Dataset root:", DATASET_ROOT if DATASET_ROOT.exists() else 'not mounted')
+print("Repo root:", REPO_ROOT)
 print("Loaded models:", ", ".join(MODELS))"""
         ),
         markdown(
@@ -76,30 +85,51 @@ Use Flash Attention 2 and a quantized load path so the KV cache has room to grow
 - If you use vLLM, keep the model quantized and lower the KV-cache pressure before running long prompts."""
         ),
         code(
-            """# Optional local inference template for notebook-based long-context experiments.
-# Uncomment the lines you need in an environment that already has the required packages.
+            """# Kaggle local inference setup for long-context experiments.
 
-# !pip install flash-attn --no-build-isolation
-# !pip install bitsandbytes transformers accelerate vllm
+%pip install flash-attn --no-build-isolation
+%pip install bitsandbytes transformers accelerate vllm sentencepiece
 
-# from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-# quantization_config = BitsAndBytesConfig(
-#     load_in_4bit=True,
-#     bnb_4bit_quant_type="nf4",
-#     bnb_4bit_compute_dtype="bfloat16",
-# )
-# model = AutoModelForCausalLM.from_pretrained(
-#     "meta-llama/Meta-Llama-3.1-8B-Instruct",
-#     attn_implementation="flash_attention_2",
-#     quantization_config=quantization_config,
-#     device_map="auto",
-# )"""
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+MODEL_LOADERS = {
+    'llama-3.1-8b-instruct': 'meta-llama/Meta-Llama-3.1-8B-Instruct',
+    'qwen-2.5-7b-instruct': 'Qwen/Qwen2.5-7B-Instruct',
+    'phi-3.5-mini-instruct': 'microsoft/Phi-3.5-mini-instruct',
+}
+
+def load_local_model(model_key: str):
+    model_id = MODEL_LOADERS[model_key]
+    quantization_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type='nf4',
+        bnb_4bit_compute_dtype='bfloat16',
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        attn_implementation='flash_attention_2',
+        quantization_config=quantization_config,
+        device_map='auto',
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return {'model': model, 'tokenizer': tokenizer, 'max_new_tokens': 4096}
+
+LOCAL_RUNTIME = {}
+
+def get_local_runtime(model_key: str):
+    runtime = LOCAL_RUNTIME.get(model_key)
+    if runtime is None:
+        runtime = load_local_model(model_key)
+        LOCAL_RUNTIME[model_key] = runtime
+    return runtime"""
         ),
         markdown("## Injectors"),
         code(
             """def inspect_injection(repo_name: str, depth: float = 0.5):
     repo = next(item for item in REPOS if item["name"] == repo_name)
-    repo_path = f"repos/{repo['name']}"
+        repo_path = str(REPO_ROOT / repo['name'])
     target_filepath = os.path.join(repo_path, repo["target_file"])
     context, mutated = inject_at_depth(
         repo_path,
@@ -123,18 +153,44 @@ inspect_injection(REPOS[0]["name"])"""
         code(
             """def run_experiment():
     results = []
+    completed_runs = set()
+
+    os.makedirs("results", exist_ok=True)
+    working_results_file = "results/raw_results.csv"
+    previous_results_file = os.environ.get(
+        "TRACELIMIT_PREVIOUS_RESULTS_FILE",
+        "/kaggle/input/your-notebook-name/results/raw_results.csv",
+    )
+
+    if os.path.exists(previous_results_file) and not os.path.exists(working_results_file):
+        import shutil
+
+        shutil.copy(previous_results_file, working_results_file)
+
+    if os.path.exists(working_results_file):
+        print("Found existing progress. Loading...")
+        existing_df = pd.read_csv(working_results_file)
+        results = existing_df.to_dict("records")
+
+        for row in results:
+            depth = row.get("depth", 0.50)
+            completed_runs.add((row["repo"], row["model"], depth))
+
+        print(f"Skipping {len(completed_runs)} previously completed runs.")
 
     control_b_repo = next(
         (
             repo
             for repo in REPOS
-            if os.path.exists(f"repos/{repo['name']}") and not repo_has_native_extensions(f"repos/{repo['name']}")
+                if os.path.exists(str(REPO_ROOT / repo['name'])) and not repo_has_native_extensions(str(REPO_ROOT / repo['name']))
         ),
         None,
     )
     if control_b_repo is not None:
         control_model_name = next(iter(MODELS))
-        control_b_repo_path = f"repos/{control_b_repo['name']}"
+        control_b_repo_path = str(REPO_ROOT / control_b_repo['name'])
+        control_start = time.perf_counter()
+        control_run_key = (control_b_repo["name"], control_model_name, 0.50)
         control_b_context = build_context(
             control_b_repo_path,
             control_b_repo["target_file"],
@@ -143,24 +199,28 @@ inspect_injection(REPOS[0]["name"])"""
             0.50,
             inject_bug=False,
         )
-        control_b_prompt = build_prompt(control_b_context, [], os.path.basename(control_b_repo["target_file"]))
-        control_b_response = call_model(MODELS[control_model_name], control_b_prompt)
-        control_b_fixed_code = extract_code_block(control_b_response)
-        control_b_success = tests_pass(control_b_repo, control_b_fixed_code)
-        results.append(
-            {
-                "repo": control_b_repo["name"],
-                "model": control_model_name,
-                "depth": 0.50,
-                "bug_type": control_b_repo["bug_type"],
-                "success": int(control_b_success),
-                "context_tokens": count_tokens(control_b_context),
-                "control": "B",
-            }
-        )
+        if control_run_key not in completed_runs:
+            control_b_prompt = build_prompt(control_b_context, [], os.path.basename(control_b_repo["target_file"]))
+            control_b_response = call_model(get_local_runtime(control_model_name), control_b_prompt)
+            control_b_fixed_code = extract_code_block(control_b_response)
+            control_b_success = tests_pass(control_b_repo, control_b_fixed_code)
+            results.append(
+                {
+                    "repo": control_b_repo["name"],
+                    "model": control_model_name,
+                    "depth": 0.50,
+                    "bug_type": control_b_repo["bug_type"],
+                    "success": int(control_b_success),
+                    "context_tokens": count_tokens(control_b_context),
+                    "control": "B",
+                    "repo_runtime_seconds": round(time.perf_counter() - control_start, 6),
+                }
+            )
+            pd.DataFrame(results).to_csv(working_results_file, index=False)
+            completed_runs.add(control_run_key)
 
     for repo in REPOS:
-        repo_path = f"repos/{repo['name']}"
+        repo_path = str(REPO_ROOT / repo['name'])
         target_filepath = os.path.join(repo_path, repo["target_file"])
 
         if not os.path.exists(repo_path) or not os.path.exists(target_filepath):
@@ -168,6 +228,9 @@ inspect_injection(REPOS[0]["name"])"""
 
         if repo_has_native_extensions(repo_path):
             continue
+
+        repo_start = time.perf_counter()
+        repo_rows = []
 
         for depth in DEPTHS:
             context, mutated = inject_at_depth(repo_path, repo["target_file"], repo["target_fn"], repo["bug_type"], depth)
@@ -181,12 +244,16 @@ inspect_injection(REPOS[0]["name"])"""
                 if (repo["name"], model_name) in EXCLUDED:
                     continue
 
+                if (repo["name"], model_name, depth) in completed_runs:
+                    print(f"Skipping {repo['name']} at depth {depth} for {model_name}")
+                    continue
+
                 prompt_payload = build_prompt(context, failures, os.path.basename(repo["target_file"]))
-                response = call_model(model_cfg, prompt_payload)
+                response = call_model(get_local_runtime(model_name), prompt_payload)
                 fixed_code = extract_code_block(response)
                 success = tests_pass(repo, fixed_code)
 
-                results.append(
+                repo_rows.append(
                     {
                         "repo": repo["name"],
                         "model": model_name,
@@ -197,7 +264,16 @@ inspect_injection(REPOS[0]["name"])"""
                     }
                 )
 
+                completed_runs.add((repo["name"], model_name, depth))
+                pd.DataFrame(results + repo_rows).to_csv(working_results_file, index=False)
+
                 time.sleep(RATE_LIMITS[model_name]["sleep"])
+
+        repo_runtime_seconds = round(time.perf_counter() - repo_start, 6)
+        for row in repo_rows:
+            row["repo_runtime_seconds"] = repo_runtime_seconds
+        results.extend(repo_rows)
+        pd.DataFrame(results).to_csv(working_results_file, index=False)
 
     return results
 
