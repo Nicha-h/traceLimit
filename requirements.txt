@@ -3,7 +3,7 @@ httpx
 arrow
 loguru
 returns
-rich
+rich>=13.3.5,<14
 cerberus
 cattrs
 attrs
