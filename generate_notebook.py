@@ -45,9 +45,14 @@ def build_notebook() -> dict:
             """# Tracelimit Experiment Notebook
 
 This notebook mirrors the repo workflow in four sections: setup, injectors, executions, and evaluations.
-It also includes a long-context note for local model runs where Flash Attention 2 and KV-cache savings matter."""
+It also includes a long-context setup section for local model inference on Kaggle GPU sessions."""
         ),
         markdown("## Setup"),
+        code(
+            """\
+# Install all project and test-suite dependencies before importing local modules.
+!pip install -r requirements.txt -q"""
+        ),
         code(
             """\
 from pathlib import Path
@@ -57,11 +62,22 @@ import time
 import pandas as pd
 import matplotlib.pyplot as plt
 
-DATASET_ROOT = Path('/kaggle/input/Repository')
+DATASET_ROOT = Path('/kaggle/input/datasets/vandanicha/repository')
 if DATASET_ROOT.exists():
-    sys.path.append(str(DATASET_ROOT))
+    sys.path.append(str(DATASET_ROOT / 'python'))
     os.environ.setdefault('TRACELIMIT_DATASET_ROOT', str(DATASET_ROOT))
-REPO_ROOT = DATASET_ROOT / 'repos' if DATASET_ROOT.exists() else Path('repos')
+
+# /kaggle/input/ is a read-only mount. validate() and tests_pass() write mutated
+# files back to disk, so repos must live under /kaggle/working/ (writable).
+# Copy once per session; skip if the copy already exists.
+_dataset_repos = DATASET_ROOT / 'repos' if DATASET_ROOT.exists() else None
+_working_repos = Path('/kaggle/working/repos')
+if _dataset_repos and _dataset_repos.exists() and not _working_repos.exists():
+    import shutil
+    print(f"Copying repos from read-only dataset to {_working_repos} ...")
+    shutil.copytree(str(_dataset_repos), str(_working_repos))
+    print("Done.")
+REPO_ROOT = _working_repos if (_dataset_repos and _dataset_repos.exists()) else Path('repos')
 
 from config import DEPTHS, MODELS, RATE_LIMITS, REPOS
 from injector import build_context, extract_target_function, inject_at_depth, repo_has_native_extensions, validate
@@ -75,45 +91,109 @@ print("Dataset root:", DATASET_ROOT if DATASET_ROOT.exists() else 'not mounted')
 print("Repo root:", REPO_ROOT)
 print("Loaded models:", ", ".join(MODELS))"""
         ),
+        code(
+            """\
+# Verify every configured target_fn is present in its target_file.
+# Mismatches cause inject_at_depth to fail later with no clear explanation;
+# surfacing them here lets you fix config.py before the full run starts.
+import ast as _ast
+
+_mismatches = []
+for _repo in REPOS:
+    _file = REPO_ROOT / _repo["name"] / _repo["target_file"]
+    if not _file.exists():
+        print(f"SKIP (file not found): {_repo['name']} — {_repo['target_file']}")
+        continue
+    try:
+        _tree = _ast.parse(_file.read_text(encoding="utf-8"))
+    except SyntaxError as _e:
+        print(f"SKIP (parse error): {_repo['name']} — {_repo['target_file']}: {_e}")
+        continue
+    _fn_names = {
+        node.name
+        for node in _ast.walk(_tree)
+        if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef))
+    }
+    if _repo["target_fn"] not in _fn_names:
+        _mismatches.append(_repo)
+        _candidates = sorted(_fn_names)
+        print(
+            f"MISMATCH: {_repo['name']} | file: {_repo['target_file']} | "
+            f"configured: '{_repo['target_fn']}' not found\n"
+            f"  Functions in file: {_candidates}"
+        )
+
+if not _mismatches:
+    print(f"OK: all {len(REPOS)} target functions verified present.")
+else:
+    print(f"\\n{len(_mismatches)} mismatch(es) — update target_fn in config.py using the lists above.")"""
+        ),
         markdown(
             """\
 ### Long-context setup
 
-When you test lost-in-the-middle behavior with local inference, the prompt for the 20 repos can dominate VRAM.
-Use Flash Attention 2 and a quantized load path so the KV cache has room to grow.
+GPU session requirements for this experiment:
 
-- Install `flash-attn` inside the notebook environment before loading the model.
-- Prefer 4-bit or 8-bit loading with `bitsandbytes` when the runtime is memory constrained.
-- If you use vLLM, keep the model quantized and lower the KV-cache pressure before running long prompts."""
+- **llama-3.1-8b-instruct** and **yi-coder-9b-chat** use standard GQA attention. Their KV cache at full 128K context exceeds a single T4's 16 GB — these models **require a Kaggle dual-T4 session** (2×16 GB, sharded via `device_map="auto"`).
+- **deepseek-coder-v2-lite-instruct** uses MLA (Multi-head Latent Attention), which compresses the KV cache. It comfortably fits full 128K context on a **single T4 or P100** (16 GB).
+
+If only a single GPU is available, depths above 50% are automatically skipped for the GQA models to avoid OOM — logged inline before each skipped run.
+
+Attention backend: **PyTorch SDPA** (`scaled_dot_product_attention`), which ships with PyTorch and is fully supported on T4 and P100. `flash-attn` is not used — it requires Ampere (sm_80+) or newer and is not supported on Kaggle's free-tier T4 (sm_75) or P100 (sm_60). SDPA still provides real memory savings over eager attention for long-context KV cache workloads. Use 4-bit quantization via `bitsandbytes` to keep weight footprint low."""
         ),
         code(
             """\
 # Kaggle local inference setup for long-context experiments.
+# GPU requirements: llama-3.1-8b-instruct and yi-coder-9b-chat need dual-T4
+# (2x16 GB, GQA attention). deepseek-coder-v2-lite-instruct uses MLA and fits
+# on a single T4/P100.
+# Attention: PyTorch SDPA — works on T4 (sm_75) and P100 (sm_60).
+# flash-attn is NOT used; it requires Ampere (sm_80+) which Kaggle free-tier lacks.
 
-%pip install flash-attn --no-build-isolation
-%pip install bitsandbytes transformers accelerate vllm sentencepiece
+import torch
+
+_n_gpus = torch.cuda.device_count()
+print(f"GPUs detected: {_n_gpus}")
+if _n_gpus < 2:
+    print(
+        "WARNING: Only 1 GPU detected. llama-3.1-8b-instruct and yi-coder-9b-chat "
+        "require dual-T4 for full 128K context (GQA KV cache). "
+        "Depths >50% will be skipped for those models. "
+        "Switch to a Kaggle dual-T4 session for full depth coverage."
+    )
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from config import SINGLE_GPU_SAFE_DEPTH_LIMIT
 
+# (model_hf_id, gpu_requirement, trust_remote_code)
+# gpu_requirement: "dual_t4" = GQA; "single_gpu" = MLA (compressed KV).
+# trust_remote_code is required only for DeepSeek-Coder-V2-Lite (custom MLA kernels).
 MODEL_LOADERS = {
-    'llama-3.1-8b-instruct': 'meta-llama/Meta-Llama-3.1-8B-Instruct',
-    'qwen-2.5-7b-instruct': 'Qwen/Qwen2.5-7B-Instruct',
-    'phi-3.5-mini-instruct': 'microsoft/Phi-3.5-mini-instruct',
+    'llama-3.1-8b-instruct': ('meta-llama/Meta-Llama-3.1-8B-Instruct', 'dual_t4', False),
+    'yi-coder-9b-chat': ('01-ai/Yi-Coder-9B-Chat', 'dual_t4', False),
+    'deepseek-coder-v2-lite-instruct': ('deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct', 'single_gpu', True),
 }
 
 def load_local_model(model_key: str):
-    model_id = MODEL_LOADERS[model_key]
+    model_id, gpu_req, trust_remote = MODEL_LOADERS[model_key]
+    if gpu_req == 'dual_t4' and torch.cuda.device_count() < 2:
+        print(
+            f"WARNING [{model_key}]: dual-T4 required but only "
+            f"{torch.cuda.device_count()} GPU(s) available. "
+            f"Depths >{SINGLE_GPU_SAFE_DEPTH_LIMIT:.0%} will be skipped."
+        )
     quantization_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type='nf4',
         bnb_4bit_compute_dtype='bfloat16',
     )
-    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True, trust_remote_code=trust_remote)
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        attn_implementation='flash_attention_2',
+        attn_implementation='sdpa',
         quantization_config=quantization_config,
         device_map='auto',
+        trust_remote_code=trust_remote,
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -126,7 +206,19 @@ def get_local_runtime(model_key: str):
     if runtime is None:
         runtime = load_local_model(model_key)
         LOCAL_RUNTIME[model_key] = runtime
-    return runtime"""
+    return runtime
+
+def is_depth_safe(model_key: str, depth: float) -> bool:
+    _, gpu_req, _ = MODEL_LOADERS[model_key]
+    if gpu_req == 'dual_t4' and torch.cuda.device_count() < 2:
+        safe = depth <= SINGLE_GPU_SAFE_DEPTH_LIMIT
+        if not safe:
+            print(
+                f"INFO [{model_key}]: skipping depth {depth:.2f} — single-GPU session, "
+                f"GQA KV cache + weights would exceed ~14 GB headroom."
+            )
+        return safe
+    return True"""
         ),
         markdown("## Injectors"),
         code(
@@ -269,6 +361,9 @@ def run_experiment():
 
             for model_name, model_cfg in MODELS.items():
                 if (repo["name"], model_name) in EXCLUDED:
+                    continue
+
+                if not is_depth_safe(model_name, depth):
                     continue
 
                 if (repo["name"], model_name, depth) in completed_runs:

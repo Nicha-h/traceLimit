@@ -5,14 +5,45 @@ from typing import Any
 
 import torch
 
-from config import MODELS
+from config import DEPTHS, MODELS, SINGLE_GPU_SAFE_DEPTH_LIMIT
 
 _HF_IDS = {name: cfg["hf_id"] for name, cfg in MODELS.items()}
+_GPU_REQS = {name: cfg["gpu_requirement"] for name, cfg in MODELS.items()}
+
+# Only DeepSeek-Coder-V2-Lite requires trust_remote_code due to custom MLA kernels.
+_TRUST_REMOTE_CODE = {"deepseek-coder-v2-lite-instruct"}
+
+
+def check_gpu_for_model(model_key: str) -> None:
+    """Print a warning before loading a dual_t4 model on a single-GPU session."""
+    n_gpus = torch.cuda.device_count()
+    if _GPU_REQS.get(model_key) == "dual_t4" and n_gpus < 2:
+        print(
+            f"WARNING [{model_key}]: requires dual-T4 (2×16 GB) for full 128K context "
+            f"but only {n_gpus} GPU(s) detected. "
+            f"Depths >{SINGLE_GPU_SAFE_DEPTH_LIMIT:.0%} will be skipped to avoid OOM "
+            f"(GQA KV cache + weights exceed ~14 GB above that point)."
+        )
+
+
+def is_depth_safe(model_key: str, depth: float) -> bool:
+    """Return False if running this depth on the current GPU setup would risk OOM."""
+    if _GPU_REQS.get(model_key) == "dual_t4" and torch.cuda.device_count() < 2:
+        safe = depth <= SINGLE_GPU_SAFE_DEPTH_LIMIT
+        if not safe:
+            print(
+                f"INFO [{model_key}]: skipping depth {depth:.2f} — single-GPU session, "
+                f"GQA KV cache + weights would exceed ~14 GB headroom."
+            )
+        return safe
+    return True
 
 
 @lru_cache(maxsize=None)
 def _load_transformers_runtime(model_key: str) -> dict[str, Any]:
     import importlib
+
+    check_gpu_for_model(model_key)
 
     transformers = importlib.import_module("transformers")
     AutoModelForCausalLM = transformers.AutoModelForCausalLM
@@ -20,17 +51,21 @@ def _load_transformers_runtime(model_key: str) -> dict[str, Any]:
     BitsAndBytesConfig = transformers.BitsAndBytesConfig
 
     model_id = _HF_IDS[model_key]
+    trust_remote = model_key in _TRUST_REMOTE_CODE
     quantization_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype="bfloat16",
     )
-    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_id, use_fast=True, trust_remote_code=trust_remote
+    )
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        attn_implementation="flash_attention_2",
+        attn_implementation="sdpa",
         quantization_config=quantization_config,
         device_map="auto",
+        trust_remote_code=trust_remote,
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token

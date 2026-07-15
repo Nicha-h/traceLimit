@@ -6,7 +6,6 @@ import json
 import subprocess
 import shutil
 from typing import Optional
-import libcst as cst
 from mutation import apply_mutation
 from config import REPOS, DEPTHS
 
@@ -99,70 +98,6 @@ def pad_to_depth(full_context: str, target_anchor: int, depth: float) -> str:
     suffix = int(round((target_anchor / max(1e-9, depth)) - total_len))
     return full_context + _build_padding(suffix)
 
-# ==========================================
-# 2. CONCRETE SYNTAX TREE (CST) MUTATIONS
-# ==========================================
-
-class BugTransformer(cst.CSTTransformer):
-    """
-    Traverses a module's Concrete Syntax Tree to apply format-preserving mutations 
-    strictly inside the target function scope.
-    """
-    def __init__(self, target_fn: str, bug_type: str):
-        self.target_fn = target_fn
-        self.bug_type = bug_type
-        self.in_target = False
-
-    def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:
-        if node.name.value == self.target_fn:
-            self.in_target = True
-        return True
-
-    def leave_FunctionDef(self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> cst.FunctionDef:
-        if original_node.name.value == self.target_fn:
-            self.in_target = False
-        return updated_node
-
-    def leave_Call(self, original_node: cst.Call, updated_node: cst.Call) -> cst.CSTNode:
-        # Type A Mutation: Off-by-one bug targeting loop bounds
-        if self.in_target and self.bug_type == "A" and isinstance(updated_node.func, cst.Name) and updated_node.func.value == "range":
-            if updated_node.args:
-                orig_arg = updated_node.args[0].value
-                new_arg = cst.BinaryOperation(
-                    left=orig_arg,
-                    operator=cst.Minus(),
-                    right=cst.Integer(value="1")
-                )
-                return updated_node.with_changes(args=[cst.Arg(value=new_arg)])
-        return updated_node
-
-    def leave_Comparison(self, original_node: cst.Comparison, updated_node: cst.Comparison) -> cst.CSTNode:
-        # Type C Mutation: Operator Swap (Inverting equality operators)
-        if self.in_target and self.bug_type == "C":
-            new_ops = []
-            for op in updated_node.operators:
-                if isinstance(op.operator, cst.Equal):
-                    new_ops.append(op.with_changes(operator=cst.NotEqual()))
-                elif isinstance(op.operator, cst.NotEqual):
-                    new_ops.append(op.with_changes(operator=cst.Equal()))
-                else:
-                    new_ops.append(op)
-            return updated_node.with_changes(operators=new_ops)
-        return updated_node
-
-
-def apply_mutation(file_content: str, target_fn: str, bug_type: str) -> str:
-    """Parses source code into a CST structure, runs mutations, and returns format-preserved source."""
-    try:
-        source_tree = cst.parse_module(file_content)
-        transformer = BugTransformer(target_fn, bug_type)
-        modified_tree = source_tree.visit(transformer)
-        return modified_tree.code
-    except Exception as e:
-        print(f"CST parsing compilation failure: {e}")
-        return file_content
-
-
 def inject_and_extract_function(repo_config: dict) -> str:
     """Loads the target file for a repo, applies the configured mutation, and returns the mutated source."""
     repo_path = os.path.join("repos", repo_config["name"])
@@ -222,17 +157,98 @@ def run_pytest(repo_path: str, mutated_file: str = None) -> list:
         except Exception as e:
             return [{"outcome": "error", "message": str(e)}]
 
-    report_path = os.path.join(repo_path, ".pytest_report.json")
-    
+    # Use absolute path: pytest runs with cwd=repo_path, so a relative path would
+    # resolve relative to the subprocess CWD, not the caller's CWD.
+    report_path = os.path.abspath(os.path.join(repo_path, ".pytest_report.json"))
+
     # Clean up stale structural tracking reports if they exist
     if os.path.exists(report_path):
         os.remove(report_path)
-        
-    cmd = ["pytest", f"--json-report", f"--json-report-file={report_path}", "-q"]
-    
+
+    cmd = [
+        "pytest",
+        f"--json-report",
+        f"--json-report-file={report_path}",
+        "--continue-on-collection-errors",
+        # Clear filterwarnings to avoid pytest crash when repos reference
+        # warning categories from uninstalled packages (e.g. hypothesis, trio).
+        "--override-ini=filterwarnings=",
+        # Clear addopts to avoid failures from uninstalled plugins
+        # (e.g. --benchmark-* from pytest-benchmark, --mypy-* from pytest-mypy).
+        "--override-ini=addopts=",
+        # click's addopts includes -m 'not stress' which we cleared above.
+        # Re-apply the marker filter to avoid 30K stress-test iterations.
+        "-m", "not stress",
+        # apscheduler's cbor2 serializer has a pre-existing AttributeError
+        # with the installed cbor2 version; all [cbor] fixture variants fail
+        # before any mutation. Exclude them to avoid baseline contamination.
+        "-k", "not cbor",
+        # Skip slow or network-bound test directories present in some repos.
+        # pytest silently ignores --ignore paths that do not exist.
+        "--ignore=tests/integration",
+        "--ignore=tests/benchmark",
+        "--ignore=tests/contrib",
+        "--ignore=benchmarks",
+        "--ignore=tests/test_cli",
+        # httpx: pre-existing failures in client integration and utility tests
+        # (test_get, test_server_extensions, etc.) that fail due to network/socket
+        # fixture issues unrelated to any mutation. Ignored to prevent baseline noise.
+        "--ignore=tests/client",
+        "--ignore=tests/test_timeouts.py",
+        "--ignore=tests/test_multipart.py",
+        "--ignore=tests/test_utils.py",
+        # deepdiff: pre-existing failures in serialization, delta, summarize, hash,
+        # model, command, and security tests due to version incompatibilities.
+        # Only test_diff_text.py and test_ignore_uuid_types.py are stable.
+        "--ignore=tests/test_serialization.py",
+        "--ignore=tests/test_delta.py",
+        "--ignore=tests/test_summarize.py",
+        "--ignore=tests/test_hash.py",
+        "--ignore=tests/test_model.py",
+        "--ignore=tests/test_command.py",
+        "--ignore=tests/test_security.py",
+        # typer: these files all fail with "Type not yet supported: typing.Any"
+        # due to a pre-existing version incompatibility; unrelated to any mutation.
+        "--ignore=tests/test_types.py",
+        "--ignore=tests/test_types_file.py",
+        "--ignore=tests/test_annotated.py",
+        "--ignore=tests/test_completion",
+        "--ignore=docs_src",
+        "--ignore=tests/test_tutorial",
+        "--ignore=tests/test_core.py",
+        "--ignore=tests/test_future_annotations.py",
+        "--ignore=tests/test_hidden.py",
+        "--ignore=tests/test_others.py",
+        "--ignore=tests/test_prepare_release.py",
+        "--ignore=tests/test_rich_markup_mode.py",
+        "--ignore=tests/test_rich_utils.py",
+        "--ignore=tests/test_suggest_commands.py",
+        "--ignore=tests/test_type_conversion.py",
+        # rich: pre-existing failures in card, markdown, and syntax snapshot tests
+        # due to terminal/rendering version incompatibilities; unrelated to any mutation.
+        "--ignore=tests/test_card.py",
+        "--ignore=tests/test_markdown.py",
+        "--ignore=tests/test_markdown_no_hyperlinks.py",
+        "--ignore=tests/test_syntax.py",
+        # structlog: pre-existing failures in CallsiteParameterAdder logging-origin
+        # tests due to process_name='n/a' instead of 'MainProcess' version mismatch.
+        "--ignore=tests/processors/test_processors.py",
+        "-q",
+    ]
+
+    # Ensure the local (possibly mutated) package is imported by pytest, not the
+    # globally-installed version. src/ layout repos need PYTHONPATH=src/; flat
+    # layout repos need the repo root. Without this, mutations to src/ packages
+    # are invisible to tests because site-packages takes precedence.
+    repo_abs = os.path.abspath(repo_path)
+    src_dir = os.path.join(repo_abs, "src")
+    inject_path = src_dir if os.path.isdir(src_dir) else repo_abs
+    env = os.environ.copy()
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = inject_path + (os.pathsep + existing if existing else "")
+
     try:
-        # Strict 60s execution bounds budget per repository standard run loop
-        result = subprocess.run(cmd, cwd=repo_path, capture_output=True, text=True, timeout=60)
+        result = subprocess.run(cmd, cwd=repo_path, capture_output=True, text=True, timeout=300, env=env)
         
         if os.path.exists(report_path):
             with open(report_path, "r") as f:

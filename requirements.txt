@@ -11,23 +11,65 @@ click
 marshmallow
 deepdiff
 sortedcontainers
-more-itertools 
+more-itertools
 glom
 typer
 funcy
 python-dateutil
-structlog 
+structlog
 apscheduler
 pytest
 pytest-json-report
 pytest-cov
+pytest-lazy-fixtures
 libcst
 rope
 asttokens
-openai 
-mistralai 
-python-dotenv 
-tqdm 
-pandas 
-matplotlib 
+openai
+mistralai
+python-dotenv
+tqdm
+pandas
+matplotlib
 seaborn
+
+# Machine learning stack (call_model.py — Kaggle GPU sessions)
+torch
+transformers
+bitsandbytes
+accelerate
+sentencepiece
+
+# Test framework plugins
+pytest-asyncio          # structlog async tests
+pytest-mock             # arrow, apscheduler mocker fixture
+pytest-randomly         # structlog, click test ordering plugin
+pytest-subtests         # returns subtests fixture
+
+# Test-suite dependencies for the 20 experiment repos
+freezegun               # loguru conftest
+hypothesis              # attrs conftest
+trustme                 # httpx conftest (TLS fixtures)
+simplejson              # marshmallow tests/base.py
+uvicorn                 # httpx conftest (ASGI server fixtures)
+whatever                # funcy test_colls.py
+cbor2                   # apscheduler CBORSerializer
+pytz                    # arrow tests
+trio                    # httpx conftest (async transport fixtures)
+tenacity                # apscheduler retry fixtures
+time-machine            # structlog tests (freeze_time fixture)
+chardet                 # httpx/tests/test_decoders.py (charset decoding)
+colorama                # isort/loguru test file imports
+exceptiongroup          # loguru tests on Python < 3.11
+six                     # python-dateutil test files
+tzdata                  # arrow timezone database
+boltons                 # glom runtime + test dep (test_error.py, test_reduction.py)
+face                    # glom runtime + test dep (test_cli.py)
+pyyaml                  # glom test extras, cattrs preconf tests
+pymongo                 # cattrs/tests/test_preconf.py (bson module-level import), apscheduler fixtures
+immutables              # cattrs/tests/test_cols.py (module-level import)
+twisted                 # structlog/tests/test_twisted.py
+shellingham             # typer optional runtime dep
+aiosqlite               # apscheduler test fixtures
+sqlalchemy[asyncio]     # apscheduler test fixtures
+typing-extensions       # cattrs, click, rich test files

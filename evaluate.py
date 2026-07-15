@@ -3,7 +3,7 @@ import time
 import pandas as pd
 from config import REPOS, DEPTHS, MODELS, EXCLUDED, RATE_LIMITS
 from injector import inject_at_depth, validate, build_context, repo_has_native_extensions
-from call_model import call_model, get_local_runtime
+from call_model import call_model, get_local_runtime, is_depth_safe
 from baseline import tests_pass
 from helpers import extract_code_block, count_tokens, build_prompt
 
@@ -80,6 +80,9 @@ if __name__ == "__main__":
 
             for model_name, model_cfg in MODELS.items():
                 if (repo['name'], model_name) in EXCLUDED:
+                    continue
+
+                if not is_depth_safe(model_name, depth):
                     continue
 
                 # Format payload text structure dynamically
