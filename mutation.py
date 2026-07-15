@@ -13,6 +13,7 @@ class BugTransformer(cst.CSTTransformer):
         self.in_target = False
         self._a_mutated = False
         self._b_mutated = False
+        self._c_mutated = False
         self._d_mutated = False
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:
@@ -88,18 +89,21 @@ class BugTransformer(cst.CSTTransformer):
         if not self.in_target:
             return updated_node
 
-        # Type C: flip == ↔ != on every comparison in the target function.
+        # Type C: flip the first == ↔ != in the target function (first occurrence only).
         # libcst Comparison.comparisons is Sequence[ComparisonTarget]; each has .operator.
-        if self.bug_type == "C":
-            new_comparisons = []
-            for comp_target in updated_node.comparisons:
+        if self.bug_type == "C" and not self._c_mutated:
+            new_comparisons = list(updated_node.comparisons)
+            for i, comp_target in enumerate(new_comparisons):
                 if isinstance(comp_target.operator, cst.Equal):
-                    new_comparisons.append(comp_target.with_changes(operator=cst.NotEqual()))
+                    new_comparisons[i] = comp_target.with_changes(operator=cst.NotEqual())
+                    self._c_mutated = True
+                    break
                 elif isinstance(comp_target.operator, cst.NotEqual):
-                    new_comparisons.append(comp_target.with_changes(operator=cst.Equal()))
-                else:
-                    new_comparisons.append(comp_target)
-            return updated_node.with_changes(comparisons=new_comparisons)
+                    new_comparisons[i] = comp_target.with_changes(operator=cst.Equal())
+                    self._c_mutated = True
+                    break
+            if self._c_mutated:
+                return updated_node.with_changes(comparisons=new_comparisons)
 
         # Type D fallback: swap left/right of the first non-None, non-symmetric binary comparison.
         # Skip is/is not — swapping their operands is semantically identical.
@@ -126,5 +130,6 @@ def apply_mutation(file_content: str, target_fn: str, bug_type: str) -> str:
         transformer = BugTransformer(target_fn, bug_type)
         modified_tree = source_tree.visit(transformer)
         return modified_tree.code
-    except Exception:
+    except Exception as e:
+        print(f"[mutation] libcst failed for '{target_fn}' (type {bug_type}): {e}")
         return file_content
