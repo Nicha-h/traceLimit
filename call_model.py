@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import gc
 import os
-from functools import lru_cache
 from typing import Any
 
 import torch
@@ -13,6 +13,8 @@ _GPU_REQS = {name: cfg["gpu_requirement"] for name, cfg in MODELS.items()}
 
 # Only DeepSeek-Coder-V2-Lite requires trust_remote_code due to custom MLA kernels.
 _TRUST_REMOTE_CODE = {"deepseek-coder-v2-lite-instruct"}
+
+_LOCAL_RUNTIME: dict[str, Any] = {}
 
 
 def check_gpu_for_model(model_key: str) -> None:
@@ -40,7 +42,6 @@ def is_depth_safe(model_key: str, depth: float) -> bool:
     return True
 
 
-@lru_cache(maxsize=None)
 def _load_transformers_runtime(model_key: str) -> dict[str, Any]:
     import importlib
 
@@ -66,9 +67,11 @@ def _load_transformers_runtime(model_key: str) -> dict[str, Any]:
     tokenizer = AutoTokenizer.from_pretrained(
         model_id, use_fast=True, trust_remote_code=trust_remote, token=hf_token
     )
+    # DeepSeek-V2 uses custom MLA attention that doesn't implement the SDPA interface.
+    attn_impl = "eager" if trust_remote else "sdpa"
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        attn_implementation="sdpa",
+        attn_implementation=attn_impl,
         quantization_config=quantization_config,
         device_map="auto",
         trust_remote_code=trust_remote,
@@ -80,10 +83,27 @@ def _load_transformers_runtime(model_key: str) -> dict[str, Any]:
 
 
 def get_local_runtime(model_key: str) -> dict[str, Any]:
-    return _load_transformers_runtime(model_key)
+    if model_key not in _LOCAL_RUNTIME:
+        _LOCAL_RUNTIME[model_key] = _load_transformers_runtime(model_key)
+    return _LOCAL_RUNTIME[model_key]
 
 
-def call_model(runtime: dict, prompt: str, temperature: float = 0.0) -> str:
+def unload_model(model_key: str) -> None:
+    runtime = _LOCAL_RUNTIME.pop(model_key, None)
+    if runtime is None:
+        return
+    model = runtime.get("model")
+    if model is not None:
+        model.cpu()
+        del model
+    del runtime
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print(f"[unload] {model_key} freed from GPU")
+
+
+def call_model(runtime: dict, prompt: str) -> str:
     model = runtime["model"]
     tokenizer = runtime["tokenizer"]
     max_new_tokens = runtime.get("max_new_tokens", 4096)

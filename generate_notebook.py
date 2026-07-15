@@ -166,7 +166,7 @@ GPU session requirements for this experiment:
 
 If only a single GPU is available, depths above 50% are automatically skipped for the GQA models to avoid OOM — logged inline before each skipped run.
 
-Attention backend: **PyTorch SDPA** (`scaled_dot_product_attention`), which ships with PyTorch and is fully supported on T4 and P100. `flash-attn` is not used — it requires Ampere (sm_80+) or newer and is not supported on Kaggle's free-tier T4 (sm_75) or P100 (sm_60). SDPA still provides real memory savings over eager attention for long-context KV cache workloads. Use 4-bit quantization via `bitsandbytes` to keep weight footprint low."""
+Attention backend: **PyTorch SDPA** for Llama and Yi-Coder; **eager** for DeepSeek-Coder-V2-Lite (its custom MLA kernel does not implement the SDPA interface). `flash-attn` is not used — it requires Ampere (sm_80+) which Kaggle's free-tier T4 (sm_75) and P100 (sm_60) do not support. Use 4-bit NF4 quantization via `bitsandbytes` to keep weight footprint low."""
         ),
         code(
             """\
@@ -221,9 +221,10 @@ def load_local_model(model_key: str):
         bnb_4bit_compute_dtype='bfloat16',
     )
     tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True, trust_remote_code=trust_remote, token=hf_token)
+    attn_impl = 'eager' if trust_remote else 'sdpa'
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        attn_implementation='sdpa',
+        attn_implementation=attn_impl,
         quantization_config=quantization_config,
         device_map='auto',
         trust_remote_code=trust_remote,
@@ -241,6 +242,21 @@ def get_local_runtime(model_key: str):
         runtime = load_local_model(model_key)
         LOCAL_RUNTIME[model_key] = runtime
     return runtime
+
+def unload_model(model_key: str):
+    import gc
+    runtime = LOCAL_RUNTIME.pop(model_key, None)
+    if runtime is None:
+        return
+    model = runtime.get('model')
+    if model is not None:
+        model.cpu()
+        del model
+    del runtime
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print(f'[unload] {model_key} freed from GPU')
 
 def is_depth_safe(model_key: str, depth: float) -> bool:
     _, gpu_req, _ = MODEL_LOADERS[model_key]
@@ -291,26 +307,26 @@ print("\\n".join(_insp["mutated"].splitlines()[:20]))"""
         markdown("## Control A — Baseline Gate"),
         code(
             """\
-from injector import read, apply_mutation
+from injector import read, apply_mutation, extract_function_from_source
 
 def run_baseline_gate():
     excluded = set()
-    for repo in REPOS:
-        repo_path = str(REPO_ROOT / repo["name"])
-        target_filepath = os.path.join(repo_path, repo["target_file"])
-        if not os.path.exists(target_filepath):
-            continue
-        # Apply mutation to the full file so the model sees a complete, importable file
-        # with the bug present — matching what baseline.py does.
-        original_content = read(target_filepath)
-        buggy_file = apply_mutation(original_content, repo["target_fn"], repo["bug_type"])
-        for model_name in MODELS:
-            prompt = build_prompt(buggy_file, [], os.path.basename(repo["target_file"]))
-            response = call_model(get_local_runtime(model_name), prompt, temperature=0.0)
+    for model_name in MODELS:
+        for repo in REPOS:
+            repo_path = str(REPO_ROOT / repo["name"])
+            target_filepath = os.path.join(repo_path, repo["target_file"])
+            if not os.path.exists(target_filepath):
+                continue
+            original_content = read(target_filepath)
+            mutated_file = apply_mutation(original_content, repo["target_fn"], repo["bug_type"])
+            buggy_fn = extract_function_from_source(mutated_file, repo["target_fn"])
+            prompt = build_prompt(buggy_fn, [], os.path.basename(repo["target_file"]))
+            response = call_model(get_local_runtime(model_name), prompt)
             fixed = extract_code_block(response)
             if not tests_pass(repo, fixed):
                 excluded.add((repo["name"], model_name))
                 print(f"EXCLUDED: {repo['name']} x {model_name} — capability failure")
+        unload_model(model_name)
     return excluded
 
 EXCLUDED = run_baseline_gate()
@@ -390,43 +406,39 @@ def run_experiment():
         completed_runs.add((repo["name"], control_model_name, 0.50, "B"))
         print(f"  Control B {repo['name']}: {'PASS' if control_b_success else 'FAIL'}")
 
-    for repo in REPOS:
-        repo_path = str(REPO_ROOT / repo['name'])
-        target_filepath = os.path.join(repo_path, repo["target_file"])
+    unload_model(control_model_name)
 
-        if not os.path.exists(repo_path) or not os.path.exists(target_filepath):
-            continue
+    for model_name, model_cfg in MODELS.items():
+        print(f"\n--- Model: {model_name} ---")
+        for repo in REPOS:
+            repo_path = str(REPO_ROOT / repo['name'])
+            target_filepath = os.path.join(repo_path, repo["target_file"])
 
-        if repo_has_native_extensions(repo_path):
-            continue
-
-        repo_start = time.perf_counter()
-        repo_rows = []
-
-        for depth in DEPTHS:
-            all_models_done = all(
-                (repo["name"], model_name, depth, "") in completed_runs
-                for model_name in MODELS
-            )
-            if all_models_done:
+            if not os.path.exists(repo_path) or not os.path.exists(target_filepath):
                 continue
 
-            context, mutated = inject_at_depth(repo_path, repo["target_file"], repo["target_fn"], repo["bug_type"], depth)
-
-            try:
-                failures = validate(repo_path, target_filepath, mutated)
-            except (AssertionError, InjectionGateError):
+            if repo_has_native_extensions(repo_path):
                 continue
 
-            for model_name, model_cfg in MODELS.items():
-                if (repo["name"], model_name) in EXCLUDED:
+            if (repo["name"], model_name) in EXCLUDED:
+                continue
+
+            repo_start = time.perf_counter()
+            repo_rows = []
+
+            for depth in DEPTHS:
+                if (repo["name"], model_name, depth, "") in completed_runs:
+                    print(f"Skipping {repo['name']} at depth {depth} for {model_name}")
                     continue
 
                 if not is_depth_safe(model_name, depth):
                     continue
 
-                if (repo["name"], model_name, depth, "") in completed_runs:
-                    print(f"Skipping {repo['name']} at depth {depth} for {model_name}")
+                context, mutated = inject_at_depth(repo_path, repo["target_file"], repo["target_fn"], repo["bug_type"], depth)
+
+                try:
+                    failures = validate(repo_path, target_filepath, mutated)
+                except (AssertionError, InjectionGateError):
                     continue
 
                 prompt_payload = build_prompt(context, failures, os.path.basename(repo["target_file"]))
@@ -452,11 +464,13 @@ def run_experiment():
 
                 time.sleep(RATE_LIMITS[model_name]["sleep"])
 
-        repo_runtime_seconds = round(time.perf_counter() - repo_start, 6)
-        for row in repo_rows:
-            row["repo_runtime_seconds"] = repo_runtime_seconds
-        results.extend(repo_rows)
-        pd.DataFrame(results).to_csv(working_results_file, index=False)
+            repo_runtime_seconds = round(time.perf_counter() - repo_start, 6)
+            for row in repo_rows:
+                row["repo_runtime_seconds"] = repo_runtime_seconds
+            results.extend(repo_rows)
+            pd.DataFrame(results).to_csv(working_results_file, index=False)
+
+        unload_model(model_name)
 
     return results
 

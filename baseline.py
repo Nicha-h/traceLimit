@@ -4,10 +4,10 @@ import json
 import os
 from pathlib import Path
 
-from call_model import call_model, get_local_runtime
+from call_model import call_model, get_local_runtime, unload_model
 from config import EXCLUDED, MODELS, REPOS
 from helpers import build_prompt
-from injector import read, run_pytest, apply_mutation, repo_has_native_extensions
+from injector import read, run_pytest, apply_mutation, extract_function_from_source, repo_has_native_extensions
 
 def tests_pass(repo_config: dict, fixed_code: str) -> bool:
     """
@@ -60,20 +60,21 @@ if __name__ == "__main__":
     if control_a_done:
         print(f"Resuming Control A: {len(control_a_done)} pairs already recorded")
 
-    for repo in REPOS:
-        repo_path = f"repos/{repo['name']}"
-        target_filepath = os.path.join(repo_path, repo["target_file"])
+    for model_name, model_cfg in MODELS.items():
+        for repo in REPOS:
+            repo_path = f"repos/{repo['name']}"
+            target_filepath = os.path.join(repo_path, repo["target_file"])
 
-        if not os.path.exists(target_filepath):
-            continue
+            if not os.path.exists(target_filepath):
+                continue
 
-        original_content = read(target_filepath)
-        buggy_fn = apply_mutation(original_content, repo["target_fn"], repo["bug_type"])
-
-        for model_name, model_cfg in MODELS.items():
             if (repo["name"], model_name) in control_a_done:
                 print(f"  Skipping {repo['name']} x {model_name} — already recorded")
                 continue
+
+            original_content = read(target_filepath)
+            mutated_file = apply_mutation(original_content, repo["target_fn"], repo["bug_type"])
+            buggy_fn = extract_function_from_source(mutated_file, repo["target_fn"])
 
             prompt = build_prompt(buggy_fn, [], os.path.basename(target_filepath))
             result = call_model(get_local_runtime(model_name), prompt)
@@ -89,6 +90,8 @@ if __name__ == "__main__":
                 "context_tokens": None, "control": "A", "repo_runtime_seconds": None,
             })
             control_a_done.add((repo["name"], model_name))
+
+        unload_model(model_name)
 
     exclusions_path = Path("results/exclusions.json")
     exclusions_path.parent.mkdir(parents=True, exist_ok=True)

@@ -7,7 +7,7 @@ from pathlib import Path
 import config
 from config import REPOS, DEPTHS, MODELS, EXCLUDED, RATE_LIMITS
 from injector import inject_at_depth, validate, build_context, repo_has_native_extensions, InjectionGateError
-from call_model import call_model, get_local_runtime, is_depth_safe
+from call_model import call_model, get_local_runtime, is_depth_safe, unload_model
 from baseline import tests_pass
 from helpers import extract_code_block, count_tokens, build_prompt
 
@@ -105,73 +105,55 @@ if __name__ == "__main__":
         completed.add((repo["name"], first_model, 0.50, "B"))
         print(f"  Control B {repo['name']}: {'PASS' if passed else 'FAIL'}")
 
+    unload_model(first_model)
+
     # ------------------------------------------------------------------
-    # Main experiment loop
+    # Main experiment loop — models-outer so only one model is in VRAM
     # ------------------------------------------------------------------
     print("\n=== Starting Main Experimentation Loop ===")
 
-    for repo in REPOS:
-        repo_path = f"repos/{repo['name']}"
-        target_filepath = os.path.join(repo_path, repo["target_file"])
+    for model_name, model_cfg in MODELS.items():
+        print(f"\n--- Model: {model_name} ---")
+        for repo in REPOS:
+            repo_path = f"repos/{repo['name']}"
+            target_filepath = os.path.join(repo_path, repo["target_file"])
 
-        if not os.path.exists(repo_path):
-            print(f"[-] Repository directory not found: {repo_path}. Skipping.")
-            continue
-
-        if not os.path.exists(target_filepath):
-            print(f"[-] Target file missing: {target_filepath}. Skipping.")
-            continue
-
-        if repo_has_native_extensions(repo_path):
-            print(f"[-] Native extensions found in {repo_path}. Skipping.")
-            continue
-
-        repo_start = time.perf_counter()
-        repo_rows = []
-
-        for depth in DEPTHS:
-            # Fix 3: skip already-completed (repo, model, depth) combinations
-            # We check per-model below, but skip building context if ALL models
-            # for this depth are already done.
-            all_models_done = all(
-                (repo["name"], model_name, depth, "") in completed
-                for model_name in MODELS
-            )
-            if all_models_done:
+            if not os.path.exists(repo_path):
+                print(f"[-] Repository directory not found: {repo_path}. Skipping.")
                 continue
 
-            # Build the physical multi-file padding context stack
-            context, mutated = inject_at_depth(repo_path, repo["target_file"], repo["target_fn"], repo["bug_type"], depth)
-
-            try:
-                # Execution validation gate check
-                failures = validate(repo_path, target_filepath, mutated)
-            except (AssertionError, InjectionGateError) as gate_err:
-                # Abort if the test fail count doesn't land in the 1-10 range
-                print(f"[SKIP] {repo['name']} depth={depth:.2f}: {gate_err}")
+            if not os.path.exists(target_filepath):
+                print(f"[-] Target file missing: {target_filepath}. Skipping.")
                 continue
 
-            for model_name, model_cfg in MODELS.items():
-                # Fix 3: skip this specific (repo, model, depth) if already done
+            if repo_has_native_extensions(repo_path):
+                print(f"[-] Native extensions found in {repo_path}. Skipping.")
+                continue
+
+            if (repo['name'], model_name) in EXCLUDED:
+                continue
+
+            repo_start = time.perf_counter()
+            repo_rows = []
+
+            for depth in DEPTHS:
                 if (repo["name"], model_name, depth, "") in completed:
-                    continue
-
-                if (repo['name'], model_name) in EXCLUDED:
                     continue
 
                 if not is_depth_safe(model_name, depth):
                     continue
 
-                # Format payload text structure dynamically
+                context, mutated = inject_at_depth(repo_path, repo["target_file"], repo["target_fn"], repo["bug_type"], depth)
+
+                try:
+                    failures = validate(repo_path, target_filepath, mutated)
+                except (AssertionError, InjectionGateError) as gate_err:
+                    print(f"[SKIP] {repo['name']} depth={depth:.2f}: {gate_err}")
+                    continue
+
                 prompt_payload = build_prompt(context, failures, os.path.basename(repo["target_file"]))
-
-                # Execute API completion
                 response = call_model(get_local_runtime(model_name), prompt_payload)
-
-                # Process outputs via your helpers module
                 fixed_code = extract_code_block(response)
-
-                # Check patch correctness state
                 success = tests_pass(repo, fixed_code)
 
                 row = {
@@ -185,15 +167,16 @@ if __name__ == "__main__":
                     "repo_runtime_seconds": None,
                 }
                 repo_rows.append(row)
-                _append_row(row)  # Fix 3: persist immediately after each call
+                _append_row(row)
                 completed.add((repo["name"], model_name, depth, ""))
 
-                # Strict rate limit compliance handling
                 time.sleep(RATE_LIMITS[model_name]["sleep"])
 
-        repo_runtime_seconds = round(time.perf_counter() - repo_start, 6)
-        for row in repo_rows:
-            row["repo_runtime_seconds"] = repo_runtime_seconds
-        all_results.extend(repo_rows)
+            repo_runtime_seconds = round(time.perf_counter() - repo_start, 6)
+            for row in repo_rows:
+                row["repo_runtime_seconds"] = repo_runtime_seconds
+            all_results.extend(repo_rows)
+
+        unload_model(model_name)
 
     print("Evaluation loop complete. Data saved to results/raw_results.csv")

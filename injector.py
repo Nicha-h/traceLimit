@@ -59,6 +59,20 @@ def extract_target_function(repo_path: str, target_file: str, target_fn: str) ->
     return source
 
 
+def extract_function_from_source(source: str, target_fn: str) -> str:
+    """Extracts a named function's source from a source string using AST line numbers."""
+    import ast
+    try:
+        tree = ast.parse(source)
+        lines = source.splitlines()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == target_fn:
+                return "\n".join(lines[node.lineno - 1:node.end_lineno])
+    except Exception:
+        pass
+    return source
+
+
 def concatenate(repo_path: str, files: list, replacements: Optional[dict] = None) -> str:
     """Merges independent source files into a unified traceable context payload."""
     delimiter = "\n\n# " + "="*40 + "\n"
