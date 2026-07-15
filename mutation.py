@@ -1,4 +1,9 @@
-import libcst as cst
+try:
+    import libcst as cst
+except ImportError:
+    import subprocess, sys
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "libcst", "-q"])
+    import libcst as cst
 
 
 class BugTransformer(cst.CSTTransformer):
