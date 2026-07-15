@@ -81,7 +81,10 @@ def call_model(runtime: dict, prompt: str, temperature: float = 0.0) -> str:
     tokenizer = runtime["tokenizer"]
     max_new_tokens = runtime.get("max_new_tokens", 4096)
 
-    messages = [{"role": "user", "content": prompt}]
+    if isinstance(prompt, list):
+        messages = prompt  # already a list of dicts from build_prompt
+    else:
+        messages = [{"role": "user", "content": prompt}]  # backwards compat
     input_ids = tokenizer.apply_chat_template(
         messages, add_generation_prompt=True, return_tensors="pt"
     ).to(model.device)

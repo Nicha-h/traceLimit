@@ -35,6 +35,7 @@ clone_repo https://github.com/PyCQA/isort
 clone_repo https://github.com/encode/httpx
 clone_repo https://github.com/arrow-py/arrow
 clone_repo https://github.com/Delgan/loguru
+# TYPE C: Operator swap
 clone_repo https://github.com/dry-python/returns
 
 # TYPE B: Boolean flip

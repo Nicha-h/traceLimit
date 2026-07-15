@@ -2,6 +2,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 df = pd.read_csv("results/raw_results.csv")
+df = df[df["control"].isna()]
 pivot = df.groupby(["model","depth"])["success"].mean().reset_index()
 
 fig, ax = plt.subplots(figsize=(10, 6))

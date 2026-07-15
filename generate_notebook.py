@@ -80,7 +80,7 @@ if _dataset_repos and _dataset_repos.exists() and not _working_repos.exists():
 REPO_ROOT = _working_repos if (_dataset_repos and _dataset_repos.exists()) else Path('repos')
 
 from config import DEPTHS, MODELS, RATE_LIMITS, REPOS
-from injector import build_context, extract_target_function, inject_at_depth, repo_has_native_extensions, validate
+from injector import build_context, extract_target_function, inject_at_depth, repo_has_native_extensions, validate, InjectionGateError
 from call_model import call_model, get_local_runtime
 from baseline import tests_pass
 from helpers import build_prompt, count_tokens, extract_code_block
@@ -297,46 +297,43 @@ def run_experiment():
 
         print(f"Skipping {len(completed_runs)} previously completed runs.")
 
-    control_b_repo = next(
-        (
-            repo
-            for repo in REPOS
-            if os.path.exists(str(REPO_ROOT / repo['name'])) and not repo_has_native_extensions(str(REPO_ROOT / repo['name']))
-        ),
-        None,
-    )
-    if control_b_repo is not None:
-        control_model_name = next(iter(MODELS))
-        control_b_repo_path = str(REPO_ROOT / control_b_repo['name'])
+    print("\\n=== Control B: Hallucination checks (all repos) ===")
+    control_model_name = next(iter(MODELS))
+    for repo in REPOS:
+        control_b_repo_path = str(REPO_ROOT / repo['name'])
+        if not os.path.exists(control_b_repo_path) or repo_has_native_extensions(control_b_repo_path):
+            continue
+        control_run_key = (repo["name"], control_model_name, 0.50)
+        if control_run_key in completed_runs:
+            continue
         control_start = time.perf_counter()
-        control_run_key = (control_b_repo["name"], control_model_name, 0.50)
         control_b_context = build_context(
             control_b_repo_path,
-            control_b_repo["target_file"],
-            control_b_repo["target_fn"],
-            control_b_repo["bug_type"],
+            repo["target_file"],
+            repo["target_fn"],
+            repo["bug_type"],
             0.50,
             inject_bug=False,
         )
-        if control_run_key not in completed_runs:
-            control_b_prompt = build_prompt(control_b_context, [], os.path.basename(control_b_repo["target_file"]))
-            control_b_response = call_model(get_local_runtime(control_model_name), control_b_prompt)
-            control_b_fixed_code = extract_code_block(control_b_response)
-            control_b_success = tests_pass(control_b_repo, control_b_fixed_code)
-            results.append(
-                {
-                    "repo": control_b_repo["name"],
-                    "model": control_model_name,
-                    "depth": 0.50,
-                    "bug_type": control_b_repo["bug_type"],
-                    "success": int(control_b_success),
-                    "context_tokens": count_tokens(control_b_context),
-                    "control": "B",
-                    "repo_runtime_seconds": round(time.perf_counter() - control_start, 6),
-                }
-            )
-            pd.DataFrame(results).to_csv(working_results_file, index=False)
-            completed_runs.add(control_run_key)
+        control_b_prompt = build_prompt(control_b_context, [], os.path.basename(repo["target_file"]))
+        control_b_response = call_model(get_local_runtime(control_model_name), control_b_prompt)
+        control_b_fixed_code = extract_code_block(control_b_response)
+        control_b_success = tests_pass(repo, control_b_fixed_code)
+        results.append(
+            {
+                "repo": repo["name"],
+                "model": control_model_name,
+                "depth": 0.50,
+                "bug_type": repo["bug_type"],
+                "success": int(control_b_success),
+                "context_tokens": count_tokens(control_b_context),
+                "control": "B",
+                "repo_runtime_seconds": round(time.perf_counter() - control_start, 6),
+            }
+        )
+        pd.DataFrame(results).to_csv(working_results_file, index=False)
+        completed_runs.add(control_run_key)
+        print(f"  Control B {repo['name']}: {'PASS' if control_b_success else 'FAIL'}")
 
     for repo in REPOS:
         repo_path = str(REPO_ROOT / repo['name'])
@@ -356,7 +353,7 @@ def run_experiment():
 
             try:
                 failures = validate(repo_path, target_filepath, mutated)
-            except AssertionError:
+            except (AssertionError, InjectionGateError):
                 continue
 
             for model_name, model_cfg in MODELS.items():
@@ -498,6 +495,22 @@ Shows how bug position within the context window affects fix rate — the *lost-
 pivot = df_exp.groupby(["model", "depth"])["success"].mean().reset_index()
 pivot["failure_rate"] = 1 - pivot["success"]
 
+# Bootstrap 95% CIs
+rng = np.random.default_rng(seed=42)
+n_boot = 1000
+ci_bands = {}  # model -> (lower_array, upper_array) across depths
+for model_name in df_exp["model"].unique():
+    lowers, uppers = [], []
+    for d in sorted(df_exp["depth"].unique()):
+        vals = df_exp[(df_exp["model"] == model_name) & (df_exp["depth"] == d)]["success"].values
+        if len(vals) == 0:
+            lowers.append(np.nan); uppers.append(np.nan)
+            continue
+        boot_means = [rng.choice(vals, size=len(vals), replace=True).mean() for _ in range(n_boot)]
+        lowers.append(np.percentile(boot_means, 2.5))
+        uppers.append(np.percentile(boot_means, 97.5))
+    ci_bands[model_name] = (np.array(lowers), np.array(uppers))
+
 fig, axes = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
 fig.suptitle(
     "Positional Bias Curve\\n(bug position in context window vs fix rate)",
@@ -509,6 +522,8 @@ palette = {
     for i, m in enumerate(sorted(pivot["model"].unique()))
 }
 
+depth_vals = sorted(df_exp["depth"].unique())
+
 for model_name, group in pivot.groupby("model"):
     g   = group.sort_values("depth")
     col = palette[model_name]
@@ -516,6 +531,16 @@ for model_name, group in pivot.groupby("model"):
                  marker="o", linewidth=2.2, color=col, label=model_name, zorder=3)
     axes[1].plot(g["depth"] * 100, g["failure_rate"] * 100,
                  marker="o", linewidth=2.2, color=col, label=model_name, zorder=3)
+    if model_name in ci_bands:
+        lower, upper = ci_bands[model_name]
+        axes[0].fill_between(
+            [d * 100 for d in depth_vals], lower * 100, upper * 100,
+            alpha=0.15, color=col,
+        )
+        axes[1].fill_between(
+            [d * 100 for d in depth_vals], (1 - upper) * 100, (1 - lower) * 100,
+            alpha=0.15, color=col,
+        )
 
 for ax in axes:
     ax.axvspan(40, 60, alpha=0.09, color="red", label="Mid-context trough zone")
@@ -541,6 +566,44 @@ fail_tbl = pivot.pivot(index="depth", columns="model", values="failure_rate").ro
 fail_tbl.index = (fail_tbl.index * 100).astype(int).astype(str) + "%"
 fail_tbl.index.name = "depth"
 print(fail_tbl.to_string())"""
+        ),
+        markdown(
+            """\
+### Statistical Tests: Edge vs Middle Positional Bias
+
+Mann-Whitney U test (one-sided: edge FSR > middle FSR) per model, plus a Friedman test across all 7 depth positions."""
+        ),
+        code(
+            """\
+from scipy import stats
+import pandas as pd
+
+print("=== Statistical Tests: Edge vs Middle Positional Bias ===\\n")
+
+results_rows = []
+for model_name in sorted(df_exp["model"].unique()):
+    m = df_exp[df_exp["model"] == model_name]
+    edge_vals = m[m["depth"].isin([0.0, 1.0])]["success"].values.astype(float)
+    mid_vals  = m[m["depth"] == 0.5]["success"].values.astype(float)
+    if len(edge_vals) == 0 or len(mid_vals) == 0:
+        continue
+    stat, p = stats.mannwhitneyu(edge_vals, mid_vals, alternative="greater")
+    results_rows.append({
+        "model": model_name,
+        "edge_mean": edge_vals.mean(),
+        "middle_mean": mid_vals.mean(),
+        "U": stat,
+        "p_value": round(p, 4),
+        "significant": "YES" if p < 0.05 else "no"
+    })
+print(pd.DataFrame(results_rows).to_string(index=False))
+
+print("\\n=== Friedman Test (all 7 depths) ===")
+depth_groups = [df_exp[df_exp["depth"] == d]["success"].values for d in sorted(df_exp["depth"].unique())]
+min_len = min(len(g) for g in depth_groups)
+depth_groups = [g[:min_len] for g in depth_groups]  # equalize lengths for Friedman
+chi2, p_friedman = stats.friedmanchisquare(*depth_groups)
+print(f"Chi2={chi2:.3f}, p={p_friedman:.4f}, {'significant' if p_friedman < 0.05 else 'not significant'} at alpha=0.05")"""
         ),
         markdown(
             """\
@@ -617,6 +680,11 @@ if "bug_type" in df_exp.columns and df_exp["bug_type"].nunique() > 1:
             [v * 100 if not np.isnan(v) else 0 for v in vals],
             width * 0.9, label=model_name, edgecolor="white", linewidth=0.6,
         )
+        for j, v in enumerate(vals):
+            if np.isnan(v):
+                bar_x_position = x[j] + offset
+                ax.text(bar_x_position, 0.02, "N/A", ha="center", va="bottom",
+                        fontsize=7, color="gray")
 
     ax.set_xticks(x)
     ax.set_xticklabels(bug_types, rotation=20, ha="right", fontsize=9)
@@ -635,7 +703,7 @@ else:
             """\
 ### Context Size vs Fix Outcome
 
-Scatter of individual runs with a rolling fix-rate trend line."""
+Scatter of individual runs with a linear trend line per model."""
         ),
         code(
             """\
@@ -658,13 +726,17 @@ if "context_tokens" in df_exp.columns:
     ax.grid(True, alpha=0.2)
 
     ax2 = ax.twinx()
-    for model_name, group in df_exp.groupby("model"):
-        g = group.sort_values("context_tokens")
-        if len(g) >= 5:
-            rolling = g["success"].rolling(window=5, center=True).mean()
-            ax2.plot(g["context_tokens"], rolling * 100,
-                     linewidth=2, alpha=0.75, label=f"{model_name} (trend)")
-    ax2.set_ylabel("Rolling Fix Rate (%)")
+    for model_name in df_exp["model"].unique():
+        subset = df_exp[df_exp["model"] == model_name].dropna(subset=["context_tokens", "success"])
+        if len(subset) < 2:
+            continue
+        x = subset["context_tokens"].values
+        y = subset["success"].values
+        coeffs = np.polyfit(x, y, 1)
+        x_line = np.linspace(x.min(), x.max(), 50)
+        ax2.plot(x_line, np.polyval(coeffs, x_line) * 100,
+                 linestyle="--", linewidth=1, label=f"{model_name} trend")
+    ax2.set_ylabel("Linear Trend Fix Rate (%)")
     ax2.set_ylim(-5, 115)
     ax2.legend(loc="upper right", fontsize=8)
 

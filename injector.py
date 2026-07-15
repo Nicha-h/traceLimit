@@ -9,6 +9,10 @@ from typing import Optional
 from mutation import apply_mutation
 from config import REPOS, DEPTHS
 
+
+class InjectionGateError(ValueError):
+    pass
+
 # ==========================================
 # 1. FILE SYSTEM & UTILITY HELPERS
 # ==========================================
@@ -29,7 +33,7 @@ def repo_has_native_extensions(repo_path: str) -> bool:
     """
     for root, _, filenames in os.walk(repo_path):
         for filename in filenames:
-            if filename.endswith((".so", ".pyd")):
+            if filename.endswith((".so", ".pyd", ".dll")):
                 return True
     return False
 
@@ -285,10 +289,9 @@ def validate(repo_path, target_filepath, mutated_file):
     failures = run_pytest(repo_path, mutated_file)
     try:
         failing_tests = [f for f in failures if f.get("outcome", "failed") == "failed"]
-        assert 1 <= len(failing_tests) <= 10, (
-            f"Mutation invalid: {len(failures)} test failures "
-            f"(need 1-10 for clean signal)"
-        )
+        n = len([f for f in failing_tests if f.get("outcome") == "failed"])
+        if not (1 <= n <= 10):
+            raise InjectionGateError(f"{n} failures (gate: 1–10)")
         return failing_tests
     finally:
         with open(target_filepath, "w", encoding="utf-8") as f:
@@ -333,7 +336,7 @@ if __name__ == "__main__":
                 # Target gate verification check
                 test_failures = validate(r_path, full_target_filepath, mutated_code)
                 print(f"    [+] PASS: Gated validation succeeded. Found {len(test_failures)} test failures.")
-            except AssertionError as error:
+            except (InjectionGateError, AssertionError) as error:
                 print(f"    [-] FAIL: {error}")
             finally:
                 # validate() restores the codebase state after each trial.

@@ -1,5 +1,8 @@
 
+import csv
+import json
 import os
+from pathlib import Path
 
 from call_model import call_model, get_local_runtime
 from config import EXCLUDED, MODELS, REPOS
@@ -30,6 +33,20 @@ def tests_pass(repo_config: dict, fixed_code: str) -> bool:
         # Always restore codebase to original healthy state
         with open(target_filepath, "w", encoding="utf-8") as f:
             f.write(original_backup)
+_RESULTS_PATH = Path("results/raw_results.csv")
+_FIELDNAMES = ["repo", "model", "depth", "bug_type", "success", "context_tokens", "control", "repo_runtime_seconds"]
+
+
+def _append_control_a_row(row: dict):
+    _RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not _RESULTS_PATH.exists()
+    with open(_RESULTS_PATH, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=_FIELDNAMES)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 if __name__ == "__main__":
     print("=== Starting Control A: Capability Baseline Check ===")
     for repo in REPOS:
@@ -45,7 +62,22 @@ if __name__ == "__main__":
         for model_name, model_cfg in MODELS.items():
             prompt = build_prompt(buggy_fn, [], os.path.basename(target_filepath))
             result = call_model(get_local_runtime(model_name), prompt)
-            
-            if not tests_pass(repo, result):
+
+            passed = tests_pass(repo, result)
+            if not passed:
                 EXCLUDED.add((repo['name'], model_name))
                 print(f"EXCLUDED: {repo['name']} x {model_name} — capability failure")
+
+            _append_control_a_row({
+                "repo": repo["name"], "model": model_name, "depth": None,
+                "bug_type": repo["bug_type"], "success": int(passed),
+                "context_tokens": None, "control": "A", "repo_runtime_seconds": None,
+            })
+
+    exclusions_path = Path("results/exclusions.json")
+    exclusions_path.parent.mkdir(parents=True, exist_ok=True)
+    exclusions_path.write_text(
+        json.dumps(sorted([list(pair) for pair in EXCLUDED]), indent=2),
+        encoding="utf-8",
+    )
+    print(f"Wrote {len(EXCLUDED)} exclusions to results/exclusions.json")
