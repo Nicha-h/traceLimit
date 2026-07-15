@@ -1,30 +1,17 @@
-# config.py
 import os
 from dotenv import load_dotenv
 
-# Load environment variables from the root .env file
 load_dotenv()
 
-# Depth points to be tested across the context window
 DEPTHS = [0.00, 0.05, 0.25, 0.50, 0.75, 0.95, 1.00]
 
-# Global runtime tracking set for (repo_name, model_name) pairs
-# that fail Control A (capability isolation check).
-# Used by evaluate.py and baseline.py. The notebook computes EXCLUDED locally
-# via run_baseline_gate() and does not import this variable.
 EXCLUDED = set()
 
-# Maximum depth to test for dual_t4 models on a single-GPU session.
-# Llama-3.1-8B and Yi-Coder-9B use standard GQA attention — their KV cache at
-# full 128K context exceeds a single T4's 16 GB. Above ~50% depth the combined
-# weight + KV footprint approaches the ~14 GB safe headroom on a single T4.
+# GQA KV cache at 128K fills a single T4 (16 GB); safe ceiling is ~50% depth.
+# MLA (DeepSeek) compresses KV and fits full 128K on one T4 or P100.
 SINGLE_GPU_SAFE_DEPTH_LIMIT = 0.50
 
-# Model configurations mapped to their specific API backends.
-# gpu_requirement:
-#   "dual_t4"   — standard GQA attention; KV cache at 128K exceeds one T4 (16 GB).
-#                 Requires Kaggle dual-T4 session (2×16 GB, device_map="auto").
-#   "single_gpu" — MLA (compressed KV cache); fits full 128K on one T4 or P100.
+# gpu_requirement: "dual_t4" = GQA (needs 2×16 GB), "single_gpu" = MLA (fits one)
 MODELS = {
     "llama-3.1-8b-instruct": {
         "hf_id": "meta-llama/Meta-Llama-3.1-8B-Instruct",
@@ -55,9 +42,7 @@ RATE_LIMITS = {
     "deepseek-coder-v2-lite-instruct": {"sleep": 0},
 }
 
-# Full 20-repository dataset meticulously mapped by type balance (5 repos per type)
 REPOS = [
-    # --- TYPE A: Off-by-one ---
     {
         "name": "isort",
         "bug_type": "A",
@@ -88,8 +73,6 @@ REPOS = [
         "target_file": "more_itertools/more.py",
         "target_fn": "divide"
     },
-
-    # --- TYPE B: Boolean Flip ---
     {
         "name": "rich",
         "bug_type": "B",
@@ -120,8 +103,6 @@ REPOS = [
         "target_file": "src/click/core.py",
         "target_fn": "_format_deprecated_suffix"
     },
-
-    # --- TYPE C: Operator Swap ---
     {
         "name": "returns",
         "bug_type": "C",
@@ -152,8 +133,6 @@ REPOS = [
         "target_file": "glom/core.py",
         "target_fn": "_unpack_stack"
     },
-
-    # --- TYPE D: Wrong Variable ---
     {
         "name": "typer",
         "bug_type": "D",

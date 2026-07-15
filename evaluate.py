@@ -37,12 +37,18 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
     # Fix 3: load already-completed rows so we can resume after a crash
     # ------------------------------------------------------------------
+    # Key is (repo, model, depth_or_None, control_str) to avoid collisions
+    # between Control B rows and experimental rows at the same depth.
     completed = set()
     all_results = []
     if results_path.exists():
         with open(results_path, newline="") as f:
             for row in csv.DictReader(f):
-                completed.add((row["repo"], row["model"], float(row["depth"])))
+                try:
+                    depth_val = float(row["depth"]) if row["depth"] else None
+                except ValueError:
+                    depth_val = None
+                completed.add((row["repo"], row["model"], depth_val, row["control"]))
         print(f"Resuming: {len(completed)} trials already completed")
 
     # ------------------------------------------------------------------
@@ -66,6 +72,9 @@ if __name__ == "__main__":
     for repo in REPOS:
         repo_path = Path("repos") / repo["name"]
         if not repo_path.exists() or repo_has_native_extensions(str(repo_path)):
+            continue
+        if (repo["name"], first_model, 0.50, "B") in completed:
+            print(f"  Control B {repo['name']}: skipped (already recorded)")
             continue
         context = build_context(
             str(repo_path),
@@ -93,6 +102,7 @@ if __name__ == "__main__":
         }
         all_results.append(row)
         _append_row(row)
+        completed.add((repo["name"], first_model, 0.50, "B"))
         print(f"  Control B {repo['name']}: {'PASS' if passed else 'FAIL'}")
 
     # ------------------------------------------------------------------
@@ -124,7 +134,7 @@ if __name__ == "__main__":
             # We check per-model below, but skip building context if ALL models
             # for this depth are already done.
             all_models_done = all(
-                (repo["name"], model_name, depth) in completed
+                (repo["name"], model_name, depth, "") in completed
                 for model_name in MODELS
             )
             if all_models_done:
@@ -143,7 +153,7 @@ if __name__ == "__main__":
 
             for model_name, model_cfg in MODELS.items():
                 # Fix 3: skip this specific (repo, model, depth) if already done
-                if (repo["name"], model_name, depth) in completed:
+                if (repo["name"], model_name, depth, "") in completed:
                     continue
 
                 if (repo['name'], model_name) in EXCLUDED:
@@ -176,6 +186,7 @@ if __name__ == "__main__":
                 }
                 repo_rows.append(row)
                 _append_row(row)  # Fix 3: persist immediately after each call
+                completed.add((repo["name"], model_name, depth, ""))
 
                 # Strict rate limit compliance handling
                 time.sleep(RATE_LIMITS[model_name]["sleep"])

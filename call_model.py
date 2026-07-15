@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from typing import Any
 
@@ -52,13 +53,18 @@ def _load_transformers_runtime(model_key: str) -> dict[str, Any]:
 
     model_id = _HF_IDS[model_key]
     trust_remote = model_key in _TRUST_REMOTE_CODE
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if trust_remote:
+        import transformers.utils.import_utils as _tui
+        if not hasattr(_tui, "is_torch_fx_available"):
+            _tui.is_torch_fx_available = lambda: False
     quantization_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype="bfloat16",
     )
     tokenizer = AutoTokenizer.from_pretrained(
-        model_id, use_fast=True, trust_remote_code=trust_remote
+        model_id, use_fast=True, trust_remote_code=trust_remote, token=hf_token
     )
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
@@ -66,6 +72,7 @@ def _load_transformers_runtime(model_key: str) -> dict[str, Any]:
         quantization_config=quantization_config,
         device_map="auto",
         trust_remote_code=trust_remote,
+        token=hf_token,
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -85,17 +92,31 @@ def call_model(runtime: dict, prompt: str, temperature: float = 0.0) -> str:
         messages = prompt  # already a list of dicts from build_prompt
     else:
         messages = [{"role": "user", "content": prompt}]  # backwards compat
-    input_ids = tokenizer.apply_chat_template(
+    _tok_out = tokenizer.apply_chat_template(
         messages, add_generation_prompt=True, return_tensors="pt"
-    ).to(model.device)
+    )
+    # Newer transformers returns BatchEncoding; older returns a raw tensor.
+    if hasattr(_tok_out, "input_ids"):
+        input_ids = _tok_out.input_ids.to(model.device)
+    else:
+        input_ids = _tok_out.to(model.device)
 
-    with torch.no_grad():
-        output_ids = model.generate(
-            input_ids,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=tokenizer.pad_token_id,
-        )
+    # Explicit mask prevents the "pad==eos, cannot infer mask" warning.
+    attention_mask = torch.ones_like(input_ids)
+
+    try:
+        with torch.no_grad():
+            output_ids = model.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        print(f"[OOM] input length {input_ids.shape[-1]} tokens — skipping this call")
+        return ""
 
     generated = output_ids[0][input_ids.shape[-1]:]
     return tokenizer.decode(generated, skip_special_tokens=True)

@@ -51,7 +51,34 @@ It also includes a long-context setup section for local model inference on Kaggl
         code(
             """\
 # Install all project and test-suite dependencies before importing local modules.
-!pip install -r requirements.txt -q"""
+_req = '/kaggle/input/datasets/vandanicha/repository/python/requirements.txt'
+!pip install -r {_req} -q"""
+        ),
+        code(
+            """\
+# Authenticate with HuggingFace for gated models (meta-llama/Llama-3.1-8B-Instruct).
+# Reads from Kaggle Secrets first (Add-ons > Secrets > HF_TOKEN), then falls back
+# to the HF_TOKEN / HUGGING_FACE_HUB_TOKEN environment variables.
+import os
+from huggingface_hub import login as _hf_login
+
+_hf_token = None
+try:
+    from kaggle_secrets import UserSecretsClient as _USC
+    _hf_token = _USC().get_secret("HF_TOKEN")
+except Exception:
+    pass
+
+if not _hf_token:
+    _hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+
+if _hf_token:
+    _hf_login(token=_hf_token, add_to_git_credential=False)
+    os.environ["HF_TOKEN"] = _hf_token
+    print("HuggingFace: authenticated.")
+else:
+    print("WARNING: HF_TOKEN not found in Kaggle Secrets or environment.")
+    print("Add it via Add-ons > Secrets > New Secret  name=HF_TOKEN  value=hf_...")"""
         ),
         code(
             """\
@@ -119,7 +146,7 @@ for _repo in REPOS:
         _candidates = sorted(_fn_names)
         print(
             f"MISMATCH: {_repo['name']} | file: {_repo['target_file']} | "
-            f"configured: '{_repo['target_fn']}' not found\n"
+            f"configured: '{_repo['target_fn']}' not found\\n"
             f"  Functions in file: {_candidates}"
         )
 
@@ -150,6 +177,7 @@ Attention backend: **PyTorch SDPA** (`scaled_dot_product_attention`), which ship
 # Attention: PyTorch SDPA — works on T4 (sm_75) and P100 (sm_60).
 # flash-attn is NOT used; it requires Ampere (sm_80+) which Kaggle free-tier lacks.
 
+import os
 import torch
 
 _n_gpus = torch.cuda.device_count()
@@ -182,18 +210,24 @@ def load_local_model(model_key: str):
             f"{torch.cuda.device_count()} GPU(s) available. "
             f"Depths >{SINGLE_GPU_SAFE_DEPTH_LIMIT:.0%} will be skipped."
         )
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if trust_remote:
+        import transformers.utils.import_utils as _tui
+        if not hasattr(_tui, "is_torch_fx_available"):
+            _tui.is_torch_fx_available = lambda: False
     quantization_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type='nf4',
         bnb_4bit_compute_dtype='bfloat16',
     )
-    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True, trust_remote_code=trust_remote)
+    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True, trust_remote_code=trust_remote, token=hf_token)
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         attn_implementation='sdpa',
         quantization_config=quantization_config,
         device_map='auto',
         trust_remote_code=trust_remote,
+        token=hf_token,
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -243,20 +277,35 @@ def inspect_injection(repo_name: str, depth: float = 0.5):
     }
 
 
-inspect_injection(REPOS[0]["name"])"""
+_insp = inspect_injection(REPOS[0]["name"])
+print(f"context_tokens : {_insp['context_tokens']}")
+_failures = _insp["failures"]
+print(f"test failures  : {len(_failures)} failure(s)")
+for _f in _failures[:5]:
+    print(f"  - {_f['nodeid']}")
+if len(_failures) > 5:
+    print(f"  ... and {len(_failures) - 5} more")
+print(f"--- mutated snippet (first 20 lines) ---")
+print("\\n".join(_insp["mutated"].splitlines()[:20]))"""
         ),
         markdown("## Control A — Baseline Gate"),
         code(
             """\
+from injector import read, apply_mutation
+
 def run_baseline_gate():
     excluded = set()
     for repo in REPOS:
         repo_path = str(REPO_ROOT / repo["name"])
-        if not os.path.exists(repo_path):
+        target_filepath = os.path.join(repo_path, repo["target_file"])
+        if not os.path.exists(target_filepath):
             continue
-        buggy_fn = extract_target_function(repo_path, repo["target_file"], repo["target_fn"])
+        # Apply mutation to the full file so the model sees a complete, importable file
+        # with the bug present — matching what baseline.py does.
+        original_content = read(target_filepath)
+        buggy_file = apply_mutation(original_content, repo["target_fn"], repo["bug_type"])
         for model_name in MODELS:
-            prompt = f"Fix the bug in this function. Return only the corrected function.\\n\\n{buggy_fn}"
+            prompt = build_prompt(buggy_file, [], os.path.basename(repo["target_file"]))
             response = call_model(get_local_runtime(model_name), prompt, temperature=0.0)
             fixed = extract_code_block(response)
             if not tests_pass(repo, fixed):
@@ -292,8 +341,14 @@ def run_experiment():
         results = existing_df.to_dict("records")
 
         for row in results:
-            depth = row.get("depth", 0.50)
-            completed_runs.add((row["repo"], row["model"], depth))
+            try:
+                depth_val = float(row["depth"]) if row.get("depth") else None
+            except (ValueError, TypeError):
+                depth_val = None
+            ctrl = row.get("control") or ""
+            if not isinstance(ctrl, str):
+                ctrl = ""
+            completed_runs.add((row["repo"], row["model"], depth_val, ctrl))
 
         print(f"Skipping {len(completed_runs)} previously completed runs.")
 
@@ -303,8 +358,8 @@ def run_experiment():
         control_b_repo_path = str(REPO_ROOT / repo['name'])
         if not os.path.exists(control_b_repo_path) or repo_has_native_extensions(control_b_repo_path):
             continue
-        control_run_key = (repo["name"], control_model_name, 0.50)
-        if control_run_key in completed_runs:
+        if (repo["name"], control_model_name, 0.50, "B") in completed_runs:
+            print(f"  Control B {repo['name']}: skipped (already recorded)")
             continue
         control_start = time.perf_counter()
         control_b_context = build_context(
@@ -332,7 +387,7 @@ def run_experiment():
             }
         )
         pd.DataFrame(results).to_csv(working_results_file, index=False)
-        completed_runs.add(control_run_key)
+        completed_runs.add((repo["name"], control_model_name, 0.50, "B"))
         print(f"  Control B {repo['name']}: {'PASS' if control_b_success else 'FAIL'}")
 
     for repo in REPOS:
@@ -349,6 +404,13 @@ def run_experiment():
         repo_rows = []
 
         for depth in DEPTHS:
+            all_models_done = all(
+                (repo["name"], model_name, depth, "") in completed_runs
+                for model_name in MODELS
+            )
+            if all_models_done:
+                continue
+
             context, mutated = inject_at_depth(repo_path, repo["target_file"], repo["target_fn"], repo["bug_type"], depth)
 
             try:
@@ -363,7 +425,7 @@ def run_experiment():
                 if not is_depth_safe(model_name, depth):
                     continue
 
-                if (repo["name"], model_name, depth) in completed_runs:
+                if (repo["name"], model_name, depth, "") in completed_runs:
                     print(f"Skipping {repo['name']} at depth {depth} for {model_name}")
                     continue
 
@@ -380,10 +442,12 @@ def run_experiment():
                         "bug_type": repo["bug_type"],
                         "success": int(success),
                         "context_tokens": count_tokens(context),
+                        "control": None,
+                        "repo_runtime_seconds": None,
                     }
                 )
 
-                completed_runs.add((repo["name"], model_name, depth))
+                completed_runs.add((repo["name"], model_name, depth, ""))
                 pd.DataFrame(results + repo_rows).to_csv(working_results_file, index=False)
 
                 time.sleep(RATE_LIMITS[model_name]["sleep"])
